@@ -5,6 +5,7 @@ import asyncio
 import logging
 import random
 import uuid
+import functools
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
@@ -15,6 +16,17 @@ from discord import app_commands
 from discord.ui import View, button
 from discord import FFmpegOpusAudio
 from gtts import gTTS
+
+# -------- asyncio.to_thread compatibility (Python 3.8+) --------
+try:
+    to_thread = asyncio.to_thread  # Python 3.9+
+except AttributeError:  # Python 3.8 fallback
+    async def to_thread(func, /, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            functools.partial(func, *args, **kwargs),
+        )
 
 
 logging.basicConfig(    
@@ -153,7 +165,7 @@ class PomodoroSession:
             tts.save(filename)
 
         # offload blocking gTTS to a thread
-        await asyncio.to_thread(_generate)
+        await to_thread(_generate)
         return filename
 
     async def _play_tts(self, text: str) -> None:
