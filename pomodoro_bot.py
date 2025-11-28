@@ -485,7 +485,7 @@ intents.message_content = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 # Track one session per user (per process)
-bot.pomodoro_sessions: dict[int, PomodoroSession] = {}
+bot.pomodoro_sessions = {}  # type: ignore
 
 
 @bot.event
