@@ -7,6 +7,7 @@ import random
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Optional
 
 import discord
 from discord.ext import commands
@@ -521,7 +522,7 @@ async def start_pomo(
     short_break: app_commands.Range[int, 1, 60] = 5,
     long_break: app_commands.Range[int, 1, 60] = 15,
     long_break_after: app_commands.Range[int, 1, 16] = 4,
-    voice_channel: discord.VoiceChannel | None = None,
+    voice_channel: Optional[discord.VoiceChannel] = None,
 ):
     """
     /start_pomo [sessions] [focus_duration] [short_break] [long_break] [long_break_after] [voice_channel]
