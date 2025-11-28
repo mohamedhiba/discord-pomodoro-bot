@@ -275,7 +275,7 @@ class PomodoroSession:
         except discord.HTTPException as e:
             logger.warning("Failed to update dashboard: %s", e)
             
-        async def _maybe_update_dashboard(self, force: bool = False) -> None:
+    async def _maybe_update_dashboard(self, force: bool = False) -> None:
         """
         Update the dashboard at most every N seconds, or more often near the end.
         This avoids relying on `remaining_seconds % 60 == 0`, which can be brittle.
