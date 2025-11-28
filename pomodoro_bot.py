@@ -124,6 +124,9 @@ class PomodoroSession:
         self.dashboard_message: discord.Message | None = None
         self.view: PomodoroView | None = None  # assigned in start()
         self.task: asyncio.Task | None = None
+        
+        # For rate-limited, time-based dashboard updates
+        self._last_dash_update: float = 0.0
 
     # ----------------- basic properties / helpers -----------------
 
@@ -271,6 +274,26 @@ class PomodoroSession:
             await self.dashboard_message.edit(embed=embed, view=self.view)
         except discord.HTTPException as e:
             logger.warning("Failed to update dashboard: %s", e)
+            
+        async def _maybe_update_dashboard(self, force: bool = False) -> None:
+        """
+        Update the dashboard at most every N seconds, or more often near the end.
+        This avoids relying on `remaining_seconds % 60 == 0`, which can be brittle.
+        """
+        if not self.dashboard_message:
+            return
+
+        now = asyncio.get_running_loop().time()
+
+        # Always update if forced, or if < 60s left, or if it's been >= 15s
+        if (
+            force
+            or self.remaining_seconds <= 60
+            or now - self._last_dash_update >= 15
+        ):
+            self._last_dash_update = now
+            await self.update_dashboard()
+
 
     # ----------------- Main lifecycle -----------------
 
@@ -298,20 +321,23 @@ class PomodoroSession:
         """
         self.remaining_seconds = int(duration_minutes * 60)
 
-        # Voice announcement
+        # Reset dashboard timer and announce
+        self._last_dash_update = 0.0
         await self._play_tts(announce_text)
-        await self.update_dashboard(force=True)
+        await self._maybe_update_dashboard(force=True)
 
-        # Timer loop: 1-second resolution, dashboard update ~every minute
+        # Timer loop: 1-second resolution,
+        # dashboard update is time-based in _maybe_update_dashboard
         while self.remaining_seconds > 0 and not self.stopped:
             if not self.is_paused:
                 self.remaining_seconds -= 1
 
-            # Update the dashboard every minute, or when < 60s left
-            if self.remaining_seconds % 60 == 0 or self.remaining_seconds < 60:
-                await self.update_dashboard()
-
+            await self._maybe_update_dashboard()
             await asyncio.sleep(1)
+
+        # One last forced update at end of phase (if not fully stopped)
+        if not self.stopped:
+            await self._maybe_update_dashboard(force=True)
 
         return not self.stopped
 
