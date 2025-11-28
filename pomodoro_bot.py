@@ -416,6 +416,25 @@ class PomodoroSession:
             self.bot.pomodoro_sessions.pop(self.user.id, None)
         except Exception:
             pass
+    
+    async def show_dashboard_message(self, channel: discord.abc.Messageable) -> None:
+        """
+        Create a fresh dashboard message in the given channel.
+        Replaces any existing dashboard message reference.
+        """
+        if not self.view:
+            self.view = PomodoroView(self)
+
+        # Try to delete old dashboard (if it exists)
+        if self.dashboard_message:
+            try:
+                await self.dashboard_message.delete()
+            except discord.HTTPException:
+                pass
+
+        embed = await self._build_embed()
+        self.dashboard_message = await channel.send(embed=embed, view=self.view)
+
 
 
 class PomodoroView(View):
@@ -643,6 +662,47 @@ async def start_pomo(
             bot.pomodoro_sessions.pop(interaction.user.id, None)
 
     asyncio.create_task(_wait_for_finish())
+
+# -----------------------------
+# Slash command: /pomo_dashboard
+# -----------------------------
+
+@bot.tree.command(
+    name="pomo_dashboard",
+    description="Show your current Pomodoro dashboard again at the bottom of the channel.",
+)
+async def pomo_dashboard(interaction: discord.Interaction):
+    # Is there an active session for this user?
+    session = bot.pomodoro_sessions.get(interaction.user.id)
+
+    if session is None or session.stopped or session.phase == Phase.DONE:
+        await interaction.response.send_message(
+            "You don't have an active Pomodoro session.",
+            ephemeral=True,
+        )
+        return
+
+    # We'll send a fresh dashboard as a followup
+    await interaction.response.defer(thinking=False, ephemeral=False)
+
+    # Ensure view exists
+    if session.view is None:
+        session.view = PomodoroView(session)
+
+    # Delete old dashboard message, if any
+    if session.dashboard_message:
+        try:
+            await session.dashboard_message.delete()
+        except discord.HTTPException:
+            pass
+
+    # Create a new dashboard at the bottom
+    embed = await session._build_embed()
+    session.dashboard_message = await interaction.followup.send(
+        embed=embed,
+        view=session.view,
+        wait=True,
+    )
 
 
 
