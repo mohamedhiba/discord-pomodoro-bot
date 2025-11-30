@@ -16,6 +16,7 @@ from discord import app_commands
 from discord.ui import View, button
 from discord import FFmpegOpusAudio
 from gtts import gTTS
+from discord.utils import get
 
 # -------- asyncio.to_thread compatibility (Python 3.8+) --------
 try:
@@ -29,7 +30,7 @@ except AttributeError:  # Python 3.8 fallback
         )
 
 
-logging.basicConfig(    
+logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
 )
@@ -78,6 +79,9 @@ MOTIVATIONAL_QUOTES = [
     "Don’t study, it’s fine. How will you ever afford even a Nissan Sunny anyway?",
 ]
 
+IN_SESSION_ROLE_NAME = "In Session"
+AUTO_REPOST_SECONDS = 600          # 10 minutes -> send a fresh dashboard message
+DASHBOARD_UPDATE_INTERVAL = 30     # edit dashboard about every 30s when > 60s left
 
 
 class Phase(Enum):
@@ -99,7 +103,7 @@ class PomodoroConfig:
 class PomodoroSession:
     """
     Represents a single user's Pomodoro run.
-    Handles state, timer, voice announcements, and dashboard updates.
+    Handles state, timer, voice announcements, dashboard updates, and participants.
     """
 
     def __init__(
@@ -121,12 +125,19 @@ class PomodoroSession:
         self.is_paused: bool = False
         self.stopped: bool = False
 
-        self.dashboard_message: discord.Message | None = None
-        self.view: PomodoroView | None = None  # assigned in start()
-        self.task: asyncio.Task | None = None
-        
+        self.dashboard_message: Optional[discord.Message] = None
+        self.view: Optional[PomodoroView] = None  # assigned in start()
+        self.task: Optional[asyncio.Task] = None
+
         # For rate-limited, time-based dashboard updates
         self._last_dash_update: float = 0.0
+
+        # For automatic reposting and mentions
+        self._last_auto_repost: float = 0.0
+        self.text_channel = interaction.channel
+
+        # Track participants (for the role)
+        self.participant_ids: set[int] = set()
 
     # ----------------- basic properties / helpers -----------------
 
@@ -215,6 +226,78 @@ class PomodoroSession:
         # Run the FFmpegOpusAudio.from_probe async work
         await _play()
 
+    # ----------------- Role / participants helpers -----------------
+
+    async def _get_or_create_role(self) -> Optional[discord.Role]:
+        guild = self.interaction.guild
+        if guild is None:
+            return None
+
+        role = get(guild.roles, name=IN_SESSION_ROLE_NAME)
+        if role is None:
+            try:
+                role = await guild.create_role(
+                    name=IN_SESSION_ROLE_NAME,
+                    mentionable=True,
+                    reason="HWPO Pomodoro session role",
+                )
+            except discord.Forbidden:
+                logger.warning("Missing permissions to create role in guild %s", guild.id)
+                return None
+        return role
+
+    async def add_participant(self, member: discord.Member) -> None:
+        role = await self._get_or_create_role()
+        if role is None:
+            return
+        try:
+            await member.add_roles(role, reason="Joined Pomodoro session")
+            self.participant_ids.add(member.id)
+        except discord.Forbidden:
+            logger.warning("Missing permission to add role to %s", member.id)
+
+    async def remove_participant(self, member: discord.Member) -> None:
+        guild = member.guild
+        role = get(guild.roles, name=IN_SESSION_ROLE_NAME)
+        if role is None:
+            return
+        try:
+            await member.remove_roles(role, reason="Left Pomodoro session")
+        except discord.Forbidden:
+            logger.warning("Missing permission to remove role from %s", member.id)
+        self.participant_ids.discard(member.id)
+
+    async def clear_participants(self) -> None:
+        guild = self.interaction.guild
+        if guild is None or not self.participant_ids:
+            return
+        role = get(guild.roles, name=IN_SESSION_ROLE_NAME)
+        if role is None:
+            return
+        members = [guild.get_member(mid) for mid in self.participant_ids]
+        for m in members:
+            if m is None:
+                continue
+            try:
+                await m.remove_roles(role, reason="Pomodoro session finished")
+            except discord.Forbidden:
+                logger.warning("Missing permission to remove role from %s", m.id)
+        self.participant_ids.clear()
+
+    async def _mention_participants(self, message: str) -> None:
+        """Mention the in-session role with a message (e.g., on break)."""
+        if not self.participant_ids:
+            return
+        guild = self.interaction.guild
+        if guild is None or self.text_channel is None:
+            return
+        role = await self._get_or_create_role()
+        if role is None:
+            return
+        try:
+            await self.text_channel.send(f"{role.mention} {message}")
+        except discord.HTTPException as e:
+            logger.warning("Failed to send break mention: %s", e)
 
     # ----------------- Dashboard / Embed -----------------
 
@@ -265,7 +348,6 @@ class PomodoroSession:
     async def update_dashboard(self, force: bool = False) -> None:
         """
         Edit the dashboard message with current state.
-        Called every minute-ish by the timer + on button interactions.
         """
         if not self.dashboard_message:
             return
@@ -274,26 +356,46 @@ class PomodoroSession:
             await self.dashboard_message.edit(embed=embed, view=self.view)
         except discord.HTTPException as e:
             logger.warning("Failed to update dashboard: %s", e)
-            
+
     async def _maybe_update_dashboard(self, force: bool = False) -> None:
         """
         Update the dashboard at most every N seconds, or more often near the end.
-        This avoids relying on `remaining_seconds % 60 == 0`, which can be brittle.
         """
         if not self.dashboard_message:
             return
 
         now = asyncio.get_running_loop().time()
 
-        # Always update if forced, or if < 60s left, or if it's been >= 15s
+        # Always update if forced, or if < 60s left, or if it's been >= interval
         if (
             force
             or self.remaining_seconds <= 60
-            or now - self._last_dash_update >= 15
+            or now - self._last_dash_update >= DASHBOARD_UPDATE_INTERVAL
         ):
             self._last_dash_update = now
             await self.update_dashboard()
 
+    async def _maybe_auto_repost_dashboard(self) -> None:
+        """
+        Every AUTO_REPOST_SECONDS, send a fresh dashboard message to the channel
+        so it appears at the bottom of chat.
+        """
+        if self.text_channel is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if now - self._last_auto_repost < AUTO_REPOST_SECONDS:
+            return
+        self._last_auto_repost = now
+
+        if self.view is None:
+            self.view = PomodoroView(self)
+
+        embed = await self._build_embed()
+        try:
+            msg = await self.text_channel.send(embed=embed, view=self.view)
+            self.dashboard_message = msg  # future edits target the newest one
+        except discord.HTTPException as e:
+            logger.warning("Failed to auto-repost dashboard: %s", e)
 
     # ----------------- Main lifecycle -----------------
 
@@ -333,6 +435,7 @@ class PomodoroSession:
                 self.remaining_seconds -= 1
 
             await self._maybe_update_dashboard()
+            await self._maybe_auto_repost_dashboard()
             await asyncio.sleep(1)
 
         # One last forced update at end of phase (if not fully stopped)
@@ -373,11 +476,15 @@ class PomodoroSession:
                     self.phase = Phase.LONG_BREAK
                     duration = self.config.long_break_minutes
                     text = f"Long break started for {duration} minutes."
+                    msg_txt = f"It's long break time! {duration} minutes. Move, hydrate, but don't vanish 👀"
                 else:
                     self.phase = Phase.SHORT_BREAK
                     duration = self.config.short_break_minutes
                     text = f"Short break started for {duration} minutes."
+                    msg_txt = f"Short break time! {duration} minutes. Breathe, stretch, then back to work."
 
+                # Announce in chat & then run the break phase
+                await self._mention_participants(msg_txt)
                 ok = await self._run_phase(duration, text)
                 if not ok:
                     break
@@ -386,6 +493,7 @@ class PomodoroSession:
             self.remaining_seconds = 0
             await self.update_dashboard(force=True)
             await self._play_tts("All Pomodoro sessions are complete. Great job.")
+            await self.clear_participants()
         finally:
             # The actual disconnect and message delete are handled in cleanup()
             pass
@@ -411,12 +519,15 @@ class PomodoroSession:
             except discord.HTTPException:
                 pass
 
+        # Clear roles from participants
+        await self.clear_participants()
+
         # Remove from bot registry in case it's still there
         try:
             self.bot.pomodoro_sessions.pop(self.user.id, None)
         except Exception:
             pass
-    
+
     async def show_dashboard_message(self, channel: discord.abc.Messageable) -> None:
         """
         Create a fresh dashboard message in the given channel.
@@ -436,11 +547,10 @@ class PomodoroSession:
         self.dashboard_message = await channel.send(embed=embed, view=self.view)
 
 
-
 class PomodoroView(View):
     """
     Interactive dashboard controls:
-    ➖ 5 mins | Pause/Resume | ➕ 5 mins | Stop
+    ➖ 5 mins | Pause/Resume | ➕ 5 mins | Stop | Join Session
     """
 
     def __init__(self, session: PomodoroSession):
@@ -450,16 +560,15 @@ class PomodoroView(View):
 
     async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
         """
-        Restrict controls to the user who started the session.
+        Restrict controls to the user who started the session (for time/stop only).
         """
         if interaction.user.id != self.session.user.id:
             await interaction.response.send_message(
-                "Only the user who started this Pomodoro can control it.",
+                "Only the user who started this Pomodoro can control the timer.",
                 ephemeral=True,
             )
             return False
         return True
-
 
     @button(
         label="-5 mins",
@@ -531,6 +640,48 @@ class PomodoroView(View):
             except discord.HTTPException:
                 pass
 
+    @button(
+        label="Join Session",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        row=1,
+    )
+    async def join_session(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        """
+        Join the current session: assigns the In Session role.
+        Anyone can use this, but they should be in the same voice channel.
+        """
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This command can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        vc = self.session.voice_client
+        if not vc or not vc.channel:
+            await interaction.response.send_message(
+                "The session is not attached to a voice channel.",
+                ephemeral=True,
+            )
+            return
+
+        if not member.voice or member.voice.channel != vc.channel:
+            await interaction.response.send_message(
+                "Join the same voice channel as the session first, then press this button.",
+                ephemeral=True,
+            )
+            return
+
+        await self.session.add_participant(member)
+        await interaction.response.send_message(
+            "You joined this Pomodoro session. You'll be pinged on breaks! 💪",
+            ephemeral=True,
+        )
+
 
 # -----------------------------
 # Bot setup
@@ -540,6 +691,7 @@ intents.guilds = True
 intents.voice_states = True
 # message_content is not required for slash commands
 intents.message_content = False
+intents.members = True  # needed for managing roles and on_voice_state_update
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 # Track one session per user (per process)
@@ -555,6 +707,26 @@ async def on_ready():
     except Exception as e:
         logger.error("Failed to sync commands: %s", e)
 
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """
+    If a member leaves the session's voice channel, drop their In Session role.
+    """
+    if member.guild is None:
+        return
+
+    for session in bot.pomodoro_sessions.values():
+        if session.stopped or session.phase == Phase.DONE:
+            continue
+        vc = session.voice_client
+        if not vc or not vc.channel:
+            continue
+        session_channel = vc.channel
+
+        # Left the session channel (either to another channel or disconnected)
+        if before.channel == session_channel and after.channel != session_channel:
+            await session.remove_participant(member)
 
 
 # -----------------------------
@@ -591,7 +763,7 @@ async def start_pomo(
     # Figure out which voice channel to join
     channel = voice_channel
     if channel is None:
-        if interaction.user and interaction.user.voice:
+        if interaction.user and getattr(interaction.user, "voice", None):
             channel = interaction.user.voice.channel
         else:
             await interaction.followup.send(
@@ -608,7 +780,7 @@ async def start_pomo(
         )
         return
 
-    voice_client: discord.VoiceClient | None
+    voice_client: Optional[discord.VoiceClient]
     if interaction.guild.voice_client:
         voice_client = interaction.guild.voice_client
         if voice_client.channel.id != channel.id:
@@ -639,7 +811,6 @@ async def start_pomo(
             )
             return
 
-
     # Register and start the session
     session = PomodoroSession(bot, interaction, voice_client, config)
     bot.pomodoro_sessions[interaction.user.id] = session
@@ -663,21 +834,35 @@ async def start_pomo(
 
     asyncio.create_task(_wait_for_finish())
 
+
 # -----------------------------
 # Slash command: /pomo_dashboard
 # -----------------------------
-
 @bot.tree.command(
     name="pomo_dashboard",
-    description="Show your current Pomodoro dashboard again at the bottom of the channel.",
+    description="Show the current Pomodoro dashboard again at the bottom of the channel.",
 )
 async def pomo_dashboard(interaction: discord.Interaction):
-    # Is there an active session for this user?
+    """
+    Anyone can use this. It finds an active session in this guild,
+    preferring the caller's own session if they have one.
+    """
     session = bot.pomodoro_sessions.get(interaction.user.id)
 
+    # If caller has no active session, search for one in this guild
     if session is None or session.stopped or session.phase == Phase.DONE:
+        session = None
+        if interaction.guild:
+            for s in bot.pomodoro_sessions.values():
+                if s.stopped or s.phase == Phase.DONE:
+                    continue
+                if s.interaction.guild and s.interaction.guild.id == interaction.guild.id:
+                    session = s
+                    break
+
+    if session is None:
         await interaction.response.send_message(
-            "You don't have an active Pomodoro session.",
+            "There is no active Pomodoro session I can show.",
             ephemeral=True,
         )
         return
@@ -706,6 +891,7 @@ async def pomo_dashboard(interaction: discord.Interaction):
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+
 
 def main():
     if not TOKEN:
