@@ -17,6 +17,7 @@ from discord.ui import View, button
 from discord import FFmpegOpusAudio
 from gtts import gTTS
 from discord.utils import get
+from dotenv import load_dotenv  
 
 # -------- asyncio.to_thread compatibility (Python 3.8+) --------
 try:
@@ -29,6 +30,8 @@ except AttributeError:  # Python 3.8 fallback
             functools.partial(func, *args, **kwargs),
         )
 
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
