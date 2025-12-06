@@ -396,10 +396,21 @@ class PomodoroSession:
         """
         if self.text_channel is None:
             return
+
         now = asyncio.get_running_loop().time()
         if now - self._last_auto_repost < AUTO_REPOST_SECONDS:
             return
+
         self._last_auto_repost = now
+
+        # if we already have a dashboard, delete the old one
+        # so there is always exactly ONE active dashboard per session
+        if self.dashboard_message:
+            try:
+                await self.dashboard_message.delete()
+            except discord.HTTPException:
+                # message might already be gone, thats fine we move
+                pass
 
         if self.view is None:
             self.view = PomodoroView(self)
